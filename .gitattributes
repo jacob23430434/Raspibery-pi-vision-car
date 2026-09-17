@@ -1,0 +1,17 @@
+# Normalise line endings to LF for text sources
+* text=auto eol=lf
+
+# Binary formats
+*.fzz binary
+*.xpm binary
+*.png binary
+*.jpg binary
+*.wbo binary
+*.wbproj binary
+
+# Text formats
+*.wbt text eol=lf
+*.kicad_sch text eol=lf
+*.kicad_pcb text eol=lf
+*.ino text eol=lf
+*.py text eol=lf

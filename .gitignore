@@ -1,0 +1,17 @@
+# Webots build artifacts (rebuilt from the Makefiles)
+simulation/**/build/
+*.dll
+*.exe
+*.o
+*.d
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

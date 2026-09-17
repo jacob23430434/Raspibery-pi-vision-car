@@ -1,0 +1,607 @@
+#include <QTRSensors.h>
+#include <Wire.h>
+#include <LiquidCrystal.h>
+#include <EEPROM.h>
+
+QTRSensors qtr;
+
+// ===== LCD（按你之前项目）=====
+const int rs = 12, en = 11, d4 = 4, d5 = 5, d6 = 6, d7 = 7;
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
+
+// ===== Rotary + Button（按你之前项目）=====
+#define BUTTON_PIN 9
+#define PUSH1 3
+#define PUSH2 10
+
+// ================= 传感器 =================
+const uint8_t SensorCount = 8;
+uint16_t sensorValues[SensorCount];
+
+// ===== error 权重 =====
+const float W[SensorCount] = { -10, -7, -4, -1, 1, 4, 7, 10 };
+
+// ===== 丢线阈值（可调）=====
+uint16_t LINE_TH = 600;
+
+// ===== PID（可调）=====
+float Kp = 6.5f, Ki = 0.0f, Kd = 2.2f;
+
+// ===== 速度（可调）=====
+int baseSpeed = 70;
+int maxSpeed  = 100;
+
+// ===== 转向参数（可调）=====
+int speed = 20;   // car_turn 里用
+unsigned int i;
+
+// ===== 状态 =====
+float holdError = 0.0f;
+float lastError = 0.0f;
+float Iterm     = 0.0f;
+bool wasLost = false;
+
+// ================== UI 状态 ==================
+enum MenuPage {
+  PAGE_KP = 0,
+  PAGE_KI,
+  PAGE_KD,
+  PAGE_BASE,
+  PAGE_MAX,
+  PAGE_TURNSPEED,
+  PAGE_LINETH,
+  PAGE_COUNT
+};
+
+MenuPage page = PAGE_KP;
+
+// 开机默认停
+bool isRunning = false;
+
+// encoder 解码
+static uint8_t lastState = 0;
+static int stepAcc = 0;
+
+// LCD 刷新节流
+unsigned long lcdLastUpdate = 0;
+
+// ================= EEPROM 存储结构 =================
+static const uint32_t EEPROM_MAGIC = 0x31525451UL; // 'QTR1' (FourCC风格)
+static const uint16_t EEPROM_VER   = 1;
+static const int EEPROM_ADDR       = 0;
+
+struct EepromData {
+  uint32_t magic;
+  uint16_t ver;
+
+  // 可调参数
+  float Kp, Ki, Kd;
+  uint16_t LINE_TH;
+  int16_t baseSpeed;
+  int16_t maxSpeed;
+  int16_t turnSpeed;
+
+  // 校准数据（calibrationOn）
+  uint16_t calMin[SensorCount];
+  uint16_t calMax[SensorCount];
+
+  // checksum
+  uint16_t checksum;
+};
+
+static inline uint16_t checksum16(const uint8_t* p, size_t n) {
+  uint16_t s = 0;
+  for (size_t k = 0; k < n; k++) s = (uint16_t)(s + p[k]);
+  return s;
+}
+
+// ================= 工具函数 =================
+static inline int clampInt(int x, int lo, int hi)
+{
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+static inline float clampFloat(float x, float lo, float hi)
+{
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+static inline float absf(float x) { return x < 0 ? -x : x; }
+
+// ================= 电机直行 =================
+void setMotor(int a, int b)
+{
+  Wire.beginTransmission(42);
+  Wire.write("baffff");
+
+  Wire.write((int)b); Wire.write(0); // 右前
+  Wire.write((int)b); Wire.write(0); // 右后
+  Wire.write((int)a); Wire.write(0); // 左前
+  Wire.write((int)a); Wire.write(0); // 左后
+
+  Wire.endTransmission();
+  delay(1);
+}
+
+// ================= 出线转向 =================
+void car_turn(char dir)   // dir = 'r' or 'l'
+{
+  Wire.beginTransmission(42);
+
+  Wire.write('b');
+  Wire.write('a');
+
+  if (dir == 'r'){
+  Wire.write('f'); // 左前反
+  Wire.write('f'); // 左后反
+  Wire.write('r'); // 右前正
+  Wire.write('r'); // 右后正
+  }
+  else{
+  Wire.write('r'); // 左前反
+  Wire.write('r'); // 左后反
+  Wire.write('f'); // 右前正
+  Wire.write('f'); // 右后正
+  }
+
+
+  Wire.write(speed); Wire.write(0);
+  Wire.write(speed); Wire.write(0);
+  Wire.write(speed); Wire.write(0);
+  Wire.write(speed); Wire.write(0);
+
+  Wire.endTransmission();
+
+
+}
+
+// ================== EEPROM：保存/读取 =================
+bool loadFromEEPROM(bool applyCalibration)
+{
+  EepromData d;
+  EEPROM.get(EEPROM_ADDR, d);
+
+  if (d.magic != EEPROM_MAGIC) return false;
+  if (d.ver != EEPROM_VER) return false;
+
+  uint16_t cs = d.checksum;
+  d.checksum = 0;
+  uint16_t calc = checksum16((const uint8_t*)&d, sizeof(EepromData));
+  if (calc != cs) return false;
+
+  // 参数
+  Kp = d.Kp; Ki = d.Ki; Kd = d.Kd;
+  LINE_TH = d.LINE_TH;
+  baseSpeed = d.baseSpeed;
+  maxSpeed  = d.maxSpeed;
+  speed     = d.turnSpeed;
+
+  // 校准：先 calibrate() 一次用于确保 calibrationOn 已分配，然后覆盖成 EEPROM 的值
+  if (applyCalibration) {
+    qtr.calibrate();
+    for (uint8_t k = 0; k < SensorCount; k++) {
+      qtr.calibrationOn.minimum[k] = d.calMin[k];
+      qtr.calibrationOn.maximum[k] = d.calMax[k];
+    }
+  }
+
+  return true;
+}
+
+void saveToEEPROM()
+{
+  EepromData d;
+  d.magic = EEPROM_MAGIC;
+  d.ver = EEPROM_VER;
+
+  d.Kp = Kp; d.Ki = Ki; d.Kd = Kd;
+  d.LINE_TH = LINE_TH;
+  d.baseSpeed = (int16_t)baseSpeed;
+  d.maxSpeed  = (int16_t)maxSpeed;
+  d.turnSpeed = (int16_t)speed;
+
+  // 确保 calibrationOn 有内存
+  qtr.calibrate();
+
+  for (uint8_t k = 0; k < SensorCount; k++) {
+    d.calMin[k] = qtr.calibrationOn.minimum[k];
+    d.calMax[k] = qtr.calibrationOn.maximum[k];
+  }
+
+  d.checksum = 0;
+  d.checksum = checksum16((const uint8_t*)&d, sizeof(EepromData));
+
+  EEPROM.put(EEPROM_ADDR, d);
+}
+
+// ================== LCD 显示 ==================
+void updateScreen()
+{
+  lcd.clear();
+
+  // 第一行：Run/Stop + 当前页名
+  lcd.setCursor(0, 0);
+  lcd.print(isRunning ? "Run " : "Stop");
+
+  lcd.setCursor(5, 0);
+  switch (page)
+  {
+    case PAGE_KP:        lcd.print("Kp"); break;
+    case PAGE_KI:        lcd.print("Ki"); break;
+    case PAGE_KD:        lcd.print("Kd"); break;
+    case PAGE_BASE:      lcd.print("Base"); break;
+    case PAGE_MAX:       lcd.print("Max"); break;
+    case PAGE_TURNSPEED: lcd.print("TurnSpd"); break;
+    case PAGE_LINETH:    lcd.print("LINE_TH"); break;
+    default:             lcd.print("Menu"); break;
+  }
+
+  // 第二行：值
+  lcd.setCursor(0, 1);
+  lcd.print("V:");
+
+  switch (page)
+  {
+    case PAGE_KP:
+      lcd.print(Kp, 2);
+      lcd.print("  step0.1");
+      break;
+    case PAGE_KI:
+      lcd.print(Ki, 3);
+      lcd.print(" step0.01");
+      break;
+    case PAGE_KD:
+      lcd.print(Kd, 2);
+      lcd.print("  step0.1");
+      break;
+    case PAGE_BASE:
+      lcd.print(baseSpeed);
+      lcd.print("   step1");
+      break;
+    case PAGE_MAX:
+      lcd.print(maxSpeed);
+      lcd.print("   step1");
+      break;
+    case PAGE_TURNSPEED:
+      lcd.print(speed);
+      lcd.print("   step1");
+      break;
+    case PAGE_LINETH:
+      lcd.print(LINE_TH);
+      lcd.print("  step10");
+      break;
+  }
+}
+
+// ================== 按键：短按翻页，长按 Run/Stop（Stop时保存） ==================
+void handleButton()
+{
+  static bool lastBtn = HIGH;
+  static unsigned long pressStart = 0;
+
+  bool curBtn = digitalRead(BUTTON_PIN);
+
+  if (lastBtn == HIGH && curBtn == LOW)
+  {
+    pressStart = millis();
+  }
+
+  if (lastBtn == LOW && curBtn == HIGH)
+  {
+    unsigned long t = millis() - pressStart;
+
+    if (t < 500)
+    {
+      // 短按：切页
+      page = (MenuPage)((page + 1) % PAGE_COUNT);
+    }
+    else
+    {
+      // 长按：Run/Stop
+      isRunning = !isRunning;
+      if (!isRunning)
+      {
+        setMotor(0, 0);
+        Iterm = 0;
+
+        // Stop时保存一次（参数+校准）
+        saveToEEPROM();
+      }
+    }
+
+    updateScreen();
+    lcdLastUpdate = millis();
+  }
+
+  lastBtn = curBtn;
+}
+
+// ================== 旋钮：改当前页参数 ==================
+void applyEncoderDelta(int dir) // dir: +1 or -1
+{
+  switch (page)
+  {
+    case PAGE_KP:
+      Kp = clampFloat(Kp + (dir > 0 ? 0.10f : -0.10f), 0.0f, 200.0f);
+      break;
+    case PAGE_KI:
+      Ki = clampFloat(Ki + (dir > 0 ? 0.01f : -0.01f), 0.0f, 50.0f);
+      break;
+    case PAGE_KD:
+      Kd = clampFloat(Kd + (dir > 0 ? 0.10f : -0.10f), 0.0f, 200.0f);
+      break;
+    case PAGE_BASE:
+      baseSpeed = clampInt(baseSpeed + (dir > 0 ? 1 : -1), 0, 100);
+      break;
+    case PAGE_MAX:
+      maxSpeed = clampInt(maxSpeed + (dir > 0 ? 1 : -1), 0, 100);
+      break;
+    case PAGE_TURNSPEED:
+      speed = clampInt(speed + (dir > 0 ? 1 : -1), 0, 100);
+      break;
+    case PAGE_LINETH:
+      LINE_TH = (uint16_t)clampInt((int)LINE_TH + (dir > 0 ? 10 : -10), 0, 1000);
+      break;
+  }
+}
+
+void handleEncoder()
+{
+  uint8_t cur = (digitalRead(PUSH2) << 1) | digitalRead(PUSH1);
+
+  if (cur != lastState)
+  {
+    if ((lastState == 0b00 && cur == 0b01) ||
+        (lastState == 0b01 && cur == 0b11) ||
+        (lastState == 0b11 && cur == 0b10) ||
+        (lastState == 0b10 && cur == 0b00))
+      stepAcc++;
+    else
+      stepAcc--;
+
+    lastState = cur;
+
+    if (cur == 0b00)
+    {
+      if (stepAcc > 0) applyEncoderDelta(+1);
+      else if (stepAcc < 0) applyEncoderDelta(-1);
+
+      stepAcc = 0;
+
+      if (millis() - lcdLastUpdate >= 80)
+      {
+        updateScreen();
+        lcdLastUpdate = millis();
+      }
+    }
+  }
+}
+
+// ================== 开机校准选择 ==================
+bool askBootCalibrate()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Boot: Calib?");
+  lcd.setCursor(0, 1);
+  lcd.print("S=Skip L=Yes");
+
+  bool lastBtn = HIGH;
+  unsigned long pressStart = 0;
+
+  while (1)
+  {
+    bool curBtn = digitalRead(BUTTON_PIN);
+
+    if (lastBtn == HIGH && curBtn == LOW) pressStart = millis();
+
+    if (lastBtn == LOW && curBtn == HIGH)
+    {
+      unsigned long t = millis() - pressStart;
+      if (t < 500) return false; // short: skip
+      else return true;          // long : calibrate
+    }
+
+    lastBtn = curBtn;
+    delay(5);
+  }
+}
+
+// ================== 50次校准：Serial.println(i) + LCD 显示 i ==================
+void doCalibration50()
+{
+  pinMode(13, OUTPUT);
+  digitalWrite(13, HIGH);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Calibrating");
+
+  for (i = 0; i < 50; i++)
+  {
+    qtr.calibrate();
+
+    // ===== 串口输出（保留你要的）=====
+    Serial.println(i);
+
+    // ===== LCD 输出（你现在要的）=====
+    lcd.setCursor(0, 1);
+    lcd.print("Step:");
+    lcd.print(i);
+    lcd.print("/49   "); // 清残影
+
+    delay(20);
+  }
+
+  digitalWrite(13, LOW);
+}
+
+// ================== setup ==================
+void setup()
+{
+  Wire.begin();
+  Serial.begin(9600);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(PUSH1, INPUT_PULLUP);
+  pinMode(PUSH2, INPUT_PULLUP);
+
+  lcd.begin(16, 2);
+
+  // QTR
+  qtr.setTypeI2C(9, SensorCount);
+  qtr.setEmitterPin(2);
+
+  delay(300);
+
+  // 先尝试从EEPROM加载（包含参数+校准）
+  bool hasEEP = loadFromEEPROM(true);
+
+  // 开机问：是否校准
+  bool wantCalib = false;
+  if (hasEEP) {
+    wantCalib = askBootCalibrate();
+  } else {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("No EEPROM data");
+    lcd.setCursor(0, 1);
+    lcd.print("Calibrating...");
+    delay(800);
+    wantCalib = true;
+  }
+
+  if (wantCalib)
+  {
+    doCalibration50();
+    saveToEEPROM();
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Calib Saved");
+    lcd.setCursor(0, 1);
+    lcd.print("EEPROM OK");
+    delay(800);
+  }
+  else
+  {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Use EEPROM Cal");
+    lcd.setCursor(0, 1);
+    lcd.print("Ready (Stop)");
+    delay(800);
+  }
+
+  // 默认停
+  isRunning = false;
+  setMotor(0, 0);
+  Iterm = 0;
+
+  updateScreen();
+
+  lastState = (digitalRead(PUSH2) << 1) | digitalRead(PUSH1);
+}
+
+
+
+
+
+
+// ================== loop ==================
+void loop()
+{
+  handleButton();
+  handleEncoder();
+
+  if (!isRunning)
+  {
+    delay(5);
+    return;
+  }
+
+  // ================== 读取循迹 ==================
+  qtr.readLineBlack(sensorValues);   // 黑=低，白=高
+
+  // ===== 丢线判定：全部 > LINE_TH =====
+  bool lost = true;
+  for (uint8_t k = 0; k < SensorCount; k++)
+  {
+    if (sensorValues[k] <= LINE_TH)
+    {
+      lost = false;
+      break;
+    }
+  }
+
+  // ===== 计算 / 保持 error =====
+  float error = holdError;
+
+  if (!lost)
+  {
+    float sum = 0, sum_w = 0;
+    for (uint8_t k = 0; k < SensorCount; k++)
+    {
+      float black = 1000.0f - sensorValues[k];
+      if (black < 0) black = 0;
+      sum   += black;
+      sum_w += black * W[k];
+    }
+    error = sum_w / sum;
+    holdError = error;
+  }
+
+  // ================== 出线逻辑 ==================
+  if (lost)
+  {
+    if (!wasLost)
+    {
+      if (holdError > 0) car_turn('l'); // 右侧出线
+      else               car_turn('r'); // 左侧出线
+    }
+    wasLost = true;
+    return;
+  }
+
+  wasLost = false;
+
+  // ================== PID 直行 ==================
+  float P = error;
+  Iterm += error;
+  float D = error - lastError;
+  lastError = error;
+
+  float turn = Kp * P + Ki * Iterm + Kd * D;
+
+  // ===== |error| 越大 base 越低（0~10 -> 100%~50%）=====
+  float eabs = absf(error);
+  eabs = clampFloat(eabs, 0.0f, 10.0f);
+
+  float scale = 1.0f - 0.5f * (eabs / 10.0f);   // 0->1.0, 10->0.5
+  int baseNow = (int)(baseSpeed * scale);
+
+  int left  = (int)(baseNow + turn);
+  int right = (int)(baseNow - turn);
+
+  left  = clampInt(left,  0, maxSpeed);
+  right = clampInt(right, 0, maxSpeed);
+
+  setMotor(left, right);
+
+  // ===== 串口输出（保留你原有格式）=====
+  for (uint8_t k = 0; k < SensorCount; k++)
+  {
+    Serial.print(sensorValues[k]);
+    Serial.print(",");
+  }
+
+  Serial.print(error, 3);
+  Serial.print(",");
+  Serial.println(lost ? 1 : 0);
+  
+  delay(5);
+}

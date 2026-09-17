@@ -1,0 +1,62 @@
+#VRML_SIM R2023b utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/robots/gctronic/e-puck/protos/E-puck.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/robots/gctronic/e-puck/protos/E-puckGroundSensors.proto"
+
+WorldInfo {
+  info [
+    "This behavior-based controller allows the e-puck robot to follow the black line, avoid obstacles and recover its path afterwards."
+    "This model of the e-puck is equipped with ground sensors, located at the front of the e-puck."
+    "Thanks to Jean-Christophe Zufferey (EPFL-LIS)."
+  ]
+  title "E-Puck"
+  basicTimeStep 5
+  FPS 120
+  lineScale 0.04
+}
+Viewpoint {
+  orientation -0.3398923688514691 -0.00438708425884173 0.9404541089751497 3.299231135047092
+  position 1.3978274942361992 0.29669554333068704 1.138728268143338
+  follow "e-puck"
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+RectangleArena {
+  rotation 0 0 1 -1.5708
+  floorSize 0.9 0.9
+  floorTileSize 0.9 0.9
+  floorAppearance PBRAppearance {
+    baseColorMap ImageTexture {
+      url [
+        "textures/Screenshot 2025-12-18 180749.png"
+      ]
+    }
+    roughness 0.2
+    metalness 0
+  }
+  wallHeight 0.05
+}
+DEF EPUCK E-puck {
+  hidden position_0_0 1043.7133279537388
+  hidden position_0_1 1001.7537391164149
+  hidden linearVelocity_0 0.12516735050310748 -0.0015521203409168875 -5.721049973703268e-07
+  hidden angularVelocity_0 0.00022309223045762037 0.01784447934752129 0.024362790354584628
+  hidden rotation_1 0 1 0 0.7045669619274714
+  hidden linearVelocity_1 0.1246234243004784 -0.0015454401987237286 -2.9710165393853627e-07
+  hidden angularVelocity_1 0.07725254369008042 6.2282868094562955 0.02437392958495447
+  hidden rotation_2 0 -0.9999999999999999 0 3.555910032318973
+  hidden linearVelocity_2 0.1258896200450503 -0.0015617594474371043 -3.00684357218417e-07
+  hidden angularVelocity_2 0.07810734645794787 6.297361491496098 0.024374834021605445
+  translation 0.24164880865609645 0.0181167514588415 -9.901164628184009e-06
+  rotation 0.0014285694417960125 0.23292675313503977 0.9724932322969235 -0.012659598330825084
+  controller "e-puck_line_demo"
+  groundSensorsSlot [
+    E-puckGroundSensors {
+    }
+  ]
+}
